@@ -1,0 +1,168 @@
+# Stella voice POC: one container per model plus an orchestrator gateway.
+#
+#   docker compose up -d                          # everything
+#   docker compose up -d orchestrator whisper     # only what you need (saves RAM)
+#   docker compose --profile cli run --rm cli python -m app.pipeline --input output/jfk.wav
+#   docker compose --profile gpu up -d            # + MuseTalk avatar (NVIDIA GPU host only)
+#
+# Only the orchestrator publishes a host port. Model services are reachable
+# solely on the internal Compose network (http://whisper:8001 etc.). There is no
+# hard depends_on: the orchestrator checks each service's /health per request,
+# so any subset of model services can run.
+
+x-model-cache: &model-cache
+  - ./models:/app/models
+
+# Model /health returns 503 until the model is loaded, so "healthy" means "ready".
+# start_period allows for a first-run model download.
+x-model-healthcheck: &model-healthcheck
+  interval: 15s
+  timeout: 10s
+  retries: 3
+  start_period: 10m
+
+services:
+  orchestrator:
+    build:
+      context: .
+      target: orchestrator
+    ports:
+      # Localhost only: the API has no authentication yet.
+      - "127.0.0.1:8000:8000"
+    environment:
+      OUTPUT_DIR: /app/output
+      WHISPER_URL: ${WHISPER_URL:-http://whisper:8001}
+      QWEN_URL: ${QWEN_URL:-http://qwen:8002}
+      KOKORO_URL: ${KOKORO_URL:-http://kokoro:8003}
+      SERVICE_TIMEOUT_SECONDS: ${SERVICE_TIMEOUT_SECONDS:-300}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-25}
+      # MuseTalk avatar service below (profile "gpu"). false = voice-only; the
+      # voice conversation works either way.
+      MUSETALK_ENABLED: ${MUSETALK_ENABLED:-false}
+      MUSETALK_SERVICE_URL: ${MUSETALK_SERVICE_URL:-http://musetalk:8010}
+      MUSETALK_TIMEOUT: ${MUSETALK_TIMEOUT:-180}
+      MUSETALK_AVATAR_ID: ${MUSETALK_AVATAR_ID:-stella}
+      MUSETALK_API_KEY: ${MUSETALK_API_KEY:-}
+      AVATAR_VIDEO_TTL_MINUTES: ${AVATAR_VIDEO_TTL_MINUTES:-60}
+      AVATARS_DIR: /app/avatars
+    volumes:
+      - ./output:/app/output
+      - ./avatars:/app/avatars:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=10)"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+
+  whisper:
+    build:
+      context: .
+      target: whisper
+    expose:
+      - "8001"
+    environment:
+      MODEL_CACHE_DIR: /app/models
+      WHISPER_MODEL: ${WHISPER_MODEL:-base}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-25}
+    volumes: *model-cache
+    healthcheck:
+      <<: *model-healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=5)"]
+
+  qwen:
+    build:
+      context: .
+      target: qwen
+    expose:
+      - "8002"
+    environment:
+      MODEL_CACHE_DIR: /app/models
+      HF_HOME: /app/models/huggingface
+      QWEN_MODEL: ${QWEN_MODEL:-Qwen/Qwen3-0.6B}
+      QWEN_MAX_NEW_TOKENS: ${QWEN_MAX_NEW_TOKENS:-256}
+    volumes: *model-cache
+    healthcheck:
+      <<: *model-healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health', timeout=5)"]
+
+  kokoro:
+    build:
+      context: .
+      target: kokoro
+    expose:
+      - "8003"
+    environment:
+      MODEL_CACHE_DIR: /app/models
+      HF_HOME: /app/models/huggingface
+      KOKORO_VOICE: ${KOKORO_VOICE:-af_heart}
+      KOKORO_SPEED: ${KOKORO_SPEED:-1.0}
+    volumes: *model-cache
+    healthcheck:
+      <<: *model-healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health', timeout=5)"]
+
+  # MuseTalk 1.5 lip-sync avatar (official real-time inference, fp16, CUDA).
+  # NVIDIA GPU host only: needs the NVIDIA driver + NVIDIA Container Toolkit.
+  # Profile "gpu" keeps it out of a plain `docker compose up` on CPU-only machines;
+  # on the GPU host set COMPOSE_PROFILES=gpu and MUSETALK_ENABLED=true in .env.
+  # Weights are not in the image: `docker compose run --rm musetalk bash /opt/stella/download_weights.sh`.
+  musetalk:
+    profiles: ["gpu"]
+    build:
+      context: ./musetalk
+    image: stella-musetalk:1.5
+    expose:
+      - "8010"   # internal Compose network only; the browser gets videos via the orchestrator
+    environment:
+      MUSETALK_API_KEY: ${MUSETALK_API_KEY:-}
+      MUSETALK_DEFAULT_AVATAR: ${MUSETALK_AVATAR_ID:-stella}
+      MUSETALK_BATCH_SIZE: ${MUSETALK_BATCH_SIZE:-20}
+      MUSETALK_GPU_ID: ${MUSETALK_GPU_ID:-0}
+      MUSETALK_MAX_AUDIO_MB: ${MUSETALK_MAX_AUDIO_MB:-20}
+      MUSETALK_MAX_AUDIO_SECONDS: ${MUSETALK_MAX_AUDIO_SECONDS:-60}
+      MUSETALK_OUTPUT_TTL_MINUTES: ${MUSETALK_OUTPUT_TTL_MINUTES:-30}
+      MUSETALK_PREPARE_ON_START: ${MUSETALK_PREPARE_ON_START:-true}
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+    volumes:
+      - ./musetalk/models:/opt/MuseTalk/models   # weights (download_weights.sh)
+      - ./avatars:/data/avatars:ro               # avatars/<id>/reference.mp4|png
+      - musetalk-results:/opt/MuseTalk/results   # prepared avatars (crops, latents, masks)
+      - ./musetalk/outputs:/data/outputs         # rendered MP4s (orchestrator copies, then deletes)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, urllib.request as u; u.urlopen(u.Request('http://localhost:8010/health', headers={'Authorization': 'Bearer ' + os.environ.get('MUSETALK_API_KEY', '')}), timeout=10)"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 15m
+    restart: unless-stopped
+
+  # Debugging CLIs (python -m app.main / app.qwen / app.kokoro / app.pipeline).
+  # Not started by `docker compose up`; use `docker compose --profile cli run --rm cli ...`.
+  cli:
+    profiles: ["cli"]
+    build:
+      context: .
+      target: cli
+    environment:
+      MODEL_CACHE_DIR: /app/models
+      OUTPUT_DIR: /app/output
+      HF_HOME: /app/models/huggingface
+      WHISPER_MODEL: ${WHISPER_MODEL:-base}
+      QWEN_MODEL: ${QWEN_MODEL:-Qwen/Qwen3-0.6B}
+      QWEN_MAX_NEW_TOKENS: ${QWEN_MAX_NEW_TOKENS:-256}
+      KOKORO_VOICE: ${KOKORO_VOICE:-af_heart}
+      KOKORO_SPEED: ${KOKORO_SPEED:-1.0}
+    volumes:
+      - ./models:/app/models
+      - ./output:/app/output
+      - ./samples:/app/samples:ro
+
+volumes:
+  musetalk-results:

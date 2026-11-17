@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Stella Voice</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="app">
+    <header class="top">
+      <div>
+        <h1>Stella</h1>
+        <p class="sub">Local Whisper → Qwen3 → Kokoro → MuseTalk</p>
+      </div>
+      <span id="status" class="status" data-phase="idle" role="status" aria-live="polite">Idle</span>
+    </header>
+
+    <nav class="tabs" aria-label="Sections">
+      <a href="#conversation" class="tab" data-view="conversation" aria-current="page">Conversation</a>
+      <a href="#lab" class="tab" data-view="lab">AI Lab</a>
+    </nav>
+
+    <div id="view-conversation" class="view">
+    <div class="layout">
+      <section class="stage-wrap" aria-label="Stella avatar">
+        <div id="stage" class="stage" data-mode="idle">
+          <img id="avatar-idle" class="stage-media" alt="Stella" hidden>
+          <div id="avatar-placeholder" class="placeholder" aria-hidden="true">
+            <svg viewBox="0 0 120 120"><circle cx="60" cy="46" r="22"/><path d="M20 112c4-24 20-36 40-36s36 12 40 36z"/></svg>
+            <span>Stella</span>
+          </div>
+          <video id="avatar-video" class="stage-media" playsinline preload="auto" hidden></video>
+          <div id="stage-overlay" class="overlay" hidden><span class="spinner" aria-hidden="true"></span><span id="overlay-text">Thinking…</span></div>
+          <button id="tap-to-play" class="tap" type="button" hidden>▶ Play Stella's reply</button>
+        </div>
+        <div class="stage-bar">
+          <span id="avatar-badge" class="badge" data-state="checking">Avatar: checking…</span>
+          <label class="toggle"><input id="avatar-toggle" type="checkbox" checked> Avatar video</label>
+        </div>
+      </section>
+
+      <section id="conversation" class="conversation" aria-live="polite">
+        <p id="empty" class="empty">Press the microphone (or Space), ask a question, then press it again to send.</p>
+      </section>
+    </div>
+
+    <p id="message" class="message" hidden></p>
+
+    <section class="controls">
+      <button id="mic" class="mic" type="button" aria-label="Start recording">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-2.08A7 7 0 0 0 19 12h-2Z"/></svg>
+        <span id="mic-label">Start</span>
+      </button>
+      <div class="side">
+        <span id="timer" class="timer" hidden>0.0 s</span>
+        <button id="stop-audio" type="button" disabled>Stop playback</button>
+        <button id="replay" type="button" disabled>Replay</button>
+        <label class="voice">Voice
+          <select id="voice">
+            <option value="af_heart">af_heart (US, female)</option>
+            <option value="af_bella">af_bella (US, female)</option>
+            <option value="am_michael">am_michael (US, male)</option>
+            <option value="bf_emma">bf_emma (UK, female)</option>
+            <option value="bm_george">bm_george (UK, male)</option>
+          </select>
+        </label>
+        <button id="clear" type="button">Clear conversation</button>
+      </div>
+      <audio id="player" class="player" controls preload="auto" hidden></audio>
+    </section>
+
+    <section class="metrics" aria-label="Last turn timings">
+      <h2>Last turn</h2>
+      <dl id="metrics">
+        <div><dt>Upload</dt><dd data-k="upload">–</dd></div>
+        <div><dt>Whisper</dt><dd data-k="transcription">–</dd></div>
+        <div><dt>Qwen3</dt><dd data-k="generation">–</dd></div>
+        <div><dt>Kokoro</dt><dd data-k="synthesis">–</dd></div>
+        <div><dt>MuseTalk render</dt><dd data-k="musetalk">–</dd></div>
+        <div><dt>Avatar total</dt><dd data-k="avatar">–</dd></div>
+        <div><dt>Server total</dt><dd data-k="server">–</dd></div>
+        <div><dt>Round trip</dt><dd data-k="roundtrip">–</dd></div>
+        <div class="key"><dt>Stop → playback</dt><dd data-k="stoptoplay">–</dd></div>
+        <div><dt>Recording</dt><dd data-k="recording">–</dd></div>
+      </dl>
+    </section>
+    </div>
+
+    <!-- AI Lab: each panel calls exactly one model service via the orchestrator. -->
+    <div id="view-lab" class="view lab" hidden>
+      <div class="lab-bar">
+        <div class="subtabs" role="tablist" aria-label="Models">
+          <button type="button" role="tab" class="subtab" data-panel="whisper" aria-selected="true">Whisper</button>
+          <button type="button" role="tab" class="subtab" data-panel="qwen" aria-selected="false">Qwen3</button>
+          <button type="button" role="tab" class="subtab" data-panel="kokoro" aria-selected="false">Kokoro</button>
+          <button type="button" role="tab" class="subtab" data-panel="musetalk" aria-selected="false">MuseTalk</button>
+        </div>
+        <button id="lab-refresh" type="button">Refresh status</button>
+      </div>
+      <p class="lab-note">Each test calls only the selected model. The conversation and its history are not used or changed.</p>
+
+      <section class="panel" data-panel="whisper" role="tabpanel" aria-label="Whisper">
+        <div class="panel-head">
+          <h2>Whisper · speech to text</h2>
+          <span class="badge" data-svc="whisper" data-state="checking">checking…</span>
+        </div>
+        <form id="whisper-form" class="lab-form">
+          <label>Audio file <small>(wav, mp3, m4a, ogg, webm, flac…)</small>
+            <input name="file" type="file" accept="audio/*,.wav,.mp3,.m4a,.ogg,.webm,.flac,.opus" required>
+          </label>
+          <div class="form-actions"><button type="submit" class="run">Transcribe</button></div>
+        </form>
+        <div id="whisper-results" class="results" aria-live="polite"></div>
+      </section>
+
+      <section class="panel" data-panel="qwen" role="tabpanel" aria-label="Qwen3" hidden>
+        <div class="panel-head">
+          <h2>Qwen3 · LLM playground</h2>
+          <span class="badge" data-svc="qwen" data-state="checking">checking…</span>
+        </div>
+        <form id="qwen-form" class="lab-form">
+          <label>Prompt
+            <textarea name="prompt" rows="4" maxlength="4000" required placeholder="Ask Qwen3 anything…"></textarea>
+          </label>
+          <label>System prompt <small>(optional; empty = the service default, Stella's persona)</small>
+            <textarea name="system_prompt" rows="2" maxlength="4000"></textarea>
+          </label>
+          <div class="form-row">
+            <label>Max new tokens <small>(empty = service default)</small>
+              <input name="max_new_tokens" type="number" min="1" max="2048" step="1" placeholder="default">
+            </label>
+          </div>
+          <div class="form-actions"><button type="submit" class="run">Generate</button></div>
+        </form>
+        <div id="qwen-results" class="results" aria-live="polite"></div>
+      </section>
+
+      <section class="panel" data-panel="kokoro" role="tabpanel" aria-label="Kokoro" hidden>
+        <div class="panel-head">
+          <h2>Kokoro · text to speech</h2>
+          <span class="badge" data-svc="kokoro" data-state="checking">checking…</span>
+        </div>
+        <form id="kokoro-form" class="lab-form">
+          <label>Text
+            <textarea name="text" rows="3" maxlength="5000" required>Hello! I'm Stella. This is a Kokoro voice test.</textarea>
+          </label>
+          <div class="form-row">
+            <label>Voice <select name="voice" id="lab-voice"></select></label>
+            <label>Speed <input name="speed" type="number" min="0.5" max="2" step="0.1" value="1.0"></label>
+          </div>
+          <div class="form-actions"><button type="submit" class="run">Synthesize</button></div>
+        </form>
+        <div id="kokoro-results" class="results" aria-live="polite"></div>
+      </section>
+
+      <section class="panel" data-panel="musetalk" role="tabpanel" aria-label="MuseTalk" hidden>
+        <div class="panel-head">
+          <h2>MuseTalk · avatar video</h2>
+          <span class="badge" data-svc="musetalk" data-state="checking">checking…</span>
+        </div>
+        <p id="musetalk-notice" class="message info" hidden></p>
+        <form id="musetalk-form" class="lab-form">
+          <div class="form-row">
+            <label>Reference avatar <select name="avatar_id" id="lab-avatar"></select></label>
+          </div>
+          <label>Audio <small>(PCM WAV, as Kokoro produces)</small>
+            <input name="file" type="file" accept=".wav,audio/wav,audio/x-wav">
+          </label>
+          <div class="form-row">
+            <button id="use-kokoro" type="button" disabled>Use latest Kokoro audio</button>
+            <span id="musetalk-source" class="hint">No audio selected.</span>
+          </div>
+          <div class="form-actions"><button type="submit" class="run">Generate video</button></div>
+        </form>
+        <div id="musetalk-results" class="results" aria-live="polite"></div>
+      </section>
+    </div>
+  </main>
+  <script src="/static/app.js"></script>
+  <script src="/static/lab.js"></script>
+</body>
+</html>

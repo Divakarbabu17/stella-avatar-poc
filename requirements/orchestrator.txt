@@ -1,0 +1,2 @@
+# Orchestrator: calls the model services over HTTP. No ML packages.
+httpx==0.28.1

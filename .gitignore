@@ -1,0 +1,20 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+
+models/*
+!models/.gitkeep
+output/*
+!output/.gitkeep
+samples/*
+!samples/.gitkeep
+
+# MuseTalk GPU machine: weights, generated videos, local secrets
+musetalk/.env
+musetalk/models/
+musetalk/outputs/
+
+# Avatar media (personal likeness): keep only the instructions in git
+avatars/*/*
+!avatars/*/README.md

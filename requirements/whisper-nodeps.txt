@@ -1,0 +1,4 @@
+# Installed with --no-deps: openai-whisper otherwise pulls triton (~286 MB GPU
+# compiler) on Linux x86_64, which CPU inference never uses. Its real runtime
+# dependencies are listed in whisper.txt (torch comes from the CPU base layer).
+openai-whisper==20250625
