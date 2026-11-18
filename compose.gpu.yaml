@@ -1,0 +1,231 @@
+# Stella GPU deployment (AI1: NVIDIA L40). Every model runs on the GPU.
+#
+# Standalone file, separate from compose.yaml (the CPU laptop workflow, unchanged).
+# Its own project name, so it never touches the CPU containers, images or volumes.
+#
+#   cp .env.gpu.example .env              # then set QWEN_API_KEY etc.
+#   docker compose -f compose.gpu.yaml build
+#   docker compose -f compose.gpu.yaml up -d
+#
+# Full procedure (weights, reference video, VRAM measurement, verification): DEPLOY_GPU.md.
+#
+# Containers (one per CUDA/PyTorch stack; they cannot share an image):
+#   qwen          official vLLM image, Qwen3 (OpenAI-compatible API on :8002)
+#   whisper       Dockerfile target "whisper", PyTorch 2.6.0 + CUDA 12.6 wheels, FP16
+#   kokoro        Dockerfile target "kokoro",  PyTorch 2.6.0 + CUDA 12.6 wheels
+#   musetalk      musetalk/Dockerfile, PyTorch 2.0.1 + CUDA 11.8 (MuseTalk's official pins)
+#   orchestrator  Dockerfile target "orchestrator" (no ML), web UI on 127.0.0.1:8000
+#
+# Internal URLs are the same as in compose.yaml: http://whisper:8001, http://qwen:8002,
+# http://kokoro:8003, http://musetalk:8010. Only the orchestrator publishes a port.
+#
+# Start order: vLLM reserves a fixed share of GPU memory at startup and checks that it
+# is free, so whisper, kokoro and musetalk start only after qwen is healthy. The
+# orchestrator has no hard dependency: it checks each service's /health per request,
+# so the UI is up (and shows "loading") while models load.
+
+name: stella-gpu
+
+x-gpu-deploy: &gpu-deploy
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          # Host GPU index. Inside each container this GPU is always cuda:0.
+          device_ids: ["${STELLA_GPU_ID:-0}"]
+          capabilities: [gpu]
+
+x-torch-gpu-build-args: &torch-gpu-build-args
+  # Same PyTorch/CUDA combination already verified in a container on AI1.
+  TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu126}
+  TORCH_SPEC: ${TORCH_SPEC:-torch==2.6.0}
+
+x-model-volume: &model-volume
+  # Shared weight cache: Whisper .pt files at the root, Hugging Face repos (Qwen3, Kokoro) under huggingface/.
+  - ${STELLA_MODELS_DIR:-./models}:/app/models
+
+x-model-healthcheck: &model-healthcheck
+  interval: 15s
+  timeout: 10s
+  retries: 3
+  start_period: 15m
+
+x-after-vllm: &after-vllm
+  qwen:
+    condition: service_healthy
+
+services:
+  # ---------- Qwen3 on vLLM ----------
+  # vllm/vllm-openai v0.33.0 (2026-11-02): CUDA 13.0.3, compiled for compute capability 8.9 (L40).
+  # CUDA 13.x needs NVIDIA driver >= 580; AI1's 596.36 is the R595 branch (CUDA 13.2).
+  # Pinned by digest (multi-arch index); change deliberately and re-test.
+  # VLLM_IMAGE override: only for an image moved with docker save/load (no registry digest
+  # after loading); verify it is the same v0.33.0 image first (DEPLOY_GPU.md).
+  qwen:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.33.0@sha256:d825baf9ce4b1b6bfc5ecc7b79880c7e6748c65a72d697ce3d47607aafa84c6e}
+    # The image's entrypoint is `vllm serve`; these are its arguments.
+    command:
+      - ${QWEN_MODEL:-Qwen/Qwen3-8B-FP8}
+      - --host=0.0.0.0
+      - --port=8002
+      # Fraction of the WHOLE GPU this vLLM instance may use (weights + KV cache + CUDA graphs).
+      # 0.35 of 46 GB = ~16 GB. Raise only after measuring the other services (DEPLOY_GPU.md).
+      - --gpu-memory-utilization=${VLLM_GPU_MEMORY_UTILIZATION:-0.35}
+      - --max-model-len=${VLLM_MAX_MODEL_LEN:-8192}
+      - --max-num-seqs=${VLLM_MAX_NUM_SEQS:-4}
+      - --enable-prefix-caching
+    environment:
+      # Same cache layout as Kokoro (models/huggingface/models--<org>--<name>).
+      HF_HUB_CACHE: /app/models/huggingface
+      # 1 = never contact Hugging Face at startup (set after pre-downloading the weights).
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+      # Protects /v1/* (not /health). Required: compose refuses to start without it.
+      VLLM_API_KEY: ${QWEN_API_KEY:?Set QWEN_API_KEY in .env (see .env.gpu.example)}
+    volumes:
+      - ${STELLA_MODELS_DIR:-./models}:/app/models
+      - vllm-cache:/root/.cache/vllm   # torch.compile / CUDA graph caches: faster restarts
+    shm_size: 8gb
+    expose:
+      - "8002"
+    deploy: *gpu-deploy
+    healthcheck:
+      # vLLM's /health returns HTTP 200 with an EMPTY body: only the status code is checked.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      # First start may download the weights and compiles/captures CUDA graphs.
+      start_period: 30m
+    restart: unless-stopped
+
+  # ---------- Whisper (CUDA, FP16) ----------
+  whisper:
+    build:
+      context: .
+      target: whisper
+      args: *torch-gpu-build-args
+    image: stella-whisper:gpu
+    expose:
+      - "8001"
+    environment:
+      MODEL_CACHE_DIR: /app/models
+      WHISPER_MODEL: ${WHISPER_MODEL:-large-v3-turbo}
+      WHISPER_DEVICE: cuda
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-25}
+      # "utility" makes nvidia-smi available for the GPU metrics in the System status panel.
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes: *model-volume
+    deploy: *gpu-deploy
+    depends_on: *after-vllm
+    healthcheck:
+      <<: *model-healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=5)"]
+    restart: unless-stopped
+
+  # ---------- Kokoro (CUDA) ----------
+  kokoro:
+    build:
+      context: .
+      target: kokoro
+      args: *torch-gpu-build-args
+    image: stella-kokoro:gpu
+    expose:
+      - "8003"
+    environment:
+      MODEL_CACHE_DIR: /app/models
+      HF_HOME: /app/models/huggingface
+      KOKORO_VOICE: ${KOKORO_VOICE:-af_heart}
+      KOKORO_SPEED: ${KOKORO_SPEED:-1.0}
+      KOKORO_DEVICE: cuda
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes: *model-volume
+    deploy: *gpu-deploy
+    depends_on: *after-vllm
+    healthcheck:
+      <<: *model-healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health', timeout=5)"]
+    restart: unless-stopped
+
+  # ---------- MuseTalk 1.5 (CUDA 11.8 stack, NOT yet tested on AI1) ----------
+  musetalk:
+    build:
+      context: ./musetalk
+    image: stella-musetalk:1.5
+    expose:
+      - "8010"
+    environment:
+      MUSETALK_API_KEY: ${MUSETALK_API_KEY:-}
+      MUSETALK_DEFAULT_AVATAR: ${MUSETALK_AVATAR_ID:-stella}
+      MUSETALK_BATCH_SIZE: ${MUSETALK_BATCH_SIZE:-20}
+      MUSETALK_GPU_ID: "0"   # the reserved GPU is always index 0 inside the container
+      MUSETALK_MAX_AUDIO_MB: ${MUSETALK_MAX_AUDIO_MB:-20}
+      MUSETALK_MAX_AUDIO_SECONDS: ${MUSETALK_MAX_AUDIO_SECONDS:-60}
+      MUSETALK_OUTPUT_TTL_MINUTES: ${MUSETALK_OUTPUT_TTL_MINUTES:-30}
+      MUSETALK_PREPARE_ON_START: ${MUSETALK_PREPARE_ON_START:-true}
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+    volumes:
+      - ${MUSETALK_MODELS_DIR:-./musetalk/models}:/opt/MuseTalk/models   # weights (download_weights.sh)
+      - ./avatars:/data/avatars:ro                                        # avatars/<id>/reference.mp4
+      - musetalk-results:/opt/MuseTalk/results                            # prepared avatars
+      - ./musetalk/outputs:/data/outputs                                  # rendered MP4s (orchestrator copies, then deletes)
+    deploy: *gpu-deploy
+    depends_on: *after-vllm
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, urllib.request as u; u.urlopen(u.Request('http://localhost:8010/health', headers={'Authorization': 'Bearer ' + os.environ.get('MUSETALK_API_KEY', '')}), timeout=10)"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 15m
+    restart: unless-stopped
+
+  # ---------- Orchestrator + web UI (no ML, no GPU) ----------
+  orchestrator:
+    build:
+      context: .
+      target: orchestrator
+    image: stella-orchestrator:gpu
+    # HTTP by default; HTTPS when STELLA_TLS_CERTFILE/KEYFILE are set (app/orchestrator/serve.py).
+    command: ["python", "-m", "app.orchestrator.serve"]
+    ports:
+      # No authentication yet: localhost only by default. See DEPLOY_GPU.md before changing.
+      - "${STELLA_BIND_ADDRESS:-127.0.0.1}:${STELLA_PORT:-8000}:8000"
+    environment:
+      STELLA_TLS_CERTFILE: ${STELLA_TLS_CERTFILE:-}
+      STELLA_TLS_KEYFILE: ${STELLA_TLS_KEYFILE:-}
+      # Display only (System status panel): vLLM's fixed share of GPU memory.
+      VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.35}
+      OUTPUT_DIR: /app/output
+      WHISPER_URL: http://whisper:8001
+      QWEN_URL: http://qwen:8002
+      KOKORO_URL: http://kokoro:8003
+      QWEN_BACKEND: vllm
+      QWEN_MODEL: ${QWEN_MODEL:-Qwen/Qwen3-8B-FP8}
+      QWEN_API_KEY: ${QWEN_API_KEY:?Set QWEN_API_KEY in .env (see .env.gpu.example)}
+      QWEN_MAX_NEW_TOKENS: ${QWEN_MAX_NEW_TOKENS:-256}
+      QWEN_SYSTEM_PROMPT: ${QWEN_SYSTEM_PROMPT:-}
+      CONVERSATION_HISTORY_MESSAGES: ${CONVERSATION_HISTORY_MESSAGES:-6}
+      CONVERSATION_MAX_NEW_TOKENS: ${CONVERSATION_MAX_NEW_TOKENS:-96}
+      SERVICE_TIMEOUT_SECONDS: ${SERVICE_TIMEOUT_SECONDS:-120}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-25}
+      MUSETALK_ENABLED: ${MUSETALK_ENABLED:-true}
+      MUSETALK_SERVICE_URL: http://musetalk:8010
+      MUSETALK_TIMEOUT: ${MUSETALK_TIMEOUT:-180}
+      MUSETALK_AVATAR_ID: ${MUSETALK_AVATAR_ID:-stella}
+      MUSETALK_API_KEY: ${MUSETALK_API_KEY:-}
+      AVATAR_VIDEO_TTL_MINUTES: ${AVATAR_VIDEO_TTL_MINUTES:-60}
+      AVATARS_DIR: /app/avatars
+    volumes:
+      - ./output:/app/output
+      - ./avatars:/app/avatars:ro
+      - ./certs:/app/certs:ro   # optional TLS certificate + key (gitignored)
+    healthcheck:
+      # Checks http:// or https:// to match the TLS setting.
+      test: ["CMD", "python", "-m", "app.orchestrator.serve", "check"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  musetalk-results:
+  vllm-cache:

@@ -1,4 +1,4 @@
-"""Kokoro text-to-speech service (CPU, English voices)."""
+"""Kokoro text-to-speech service (English voices; CPU by default, CUDA when device is cuda)."""
 
 import io
 import re
@@ -7,7 +7,7 @@ import time
 import wave
 from pathlib import Path
 
-from . import InvalidInputError, require_module
+from . import InvalidInputError, require_module, resolve_device
 
 SAMPLE_RATE = 24000
 WEIGHTS_FILE = "kokoro-v1_0.pth"
@@ -41,10 +41,11 @@ def to_wav_bytes(audio) -> bytes:
 
 
 class KokoroService:
-    def __init__(self, repo_id: str, cache_dir: Path, default_voice: str, default_speed: float):
+    def __init__(self, repo_id: str, cache_dir: Path, default_voice: str, default_speed: float, device: str = "cpu"):
         self._torch = require_module("torch")
         self._kokoro = require_module("kokoro")
         self._hub = require_module("huggingface_hub")
+        self.device = resolve_device(device)
         cache_dir.mkdir(parents=True, exist_ok=True)
         self.repo_id = repo_id
         self.cache_dir = cache_dir
@@ -57,7 +58,9 @@ class KokoroService:
         started_at = time.perf_counter()
         config_path = self._download("config.json")
         weights_path = self._download(WEIGHTS_FILE)
-        self.model = self._kokoro.KModel(repo_id=repo_id, config=config_path, model=weights_path).to("cpu").eval()
+        # KPipeline moves each voice pack to model.device and KModel.forward moves its
+        # inputs there too, so placing the model on the device puts all inference on it.
+        self.model = self._kokoro.KModel(repo_id=repo_id, config=config_path, model=weights_path).to(self.device).eval()
         # Warm the default voice's G2P pipeline and voice pack so the first request is fast.
         self._pipeline(self.default_voice[0])
         self._voice_path(self.default_voice)
@@ -69,7 +72,7 @@ class KokoroService:
     def _pipeline(self, lang_code: str):
         if lang_code not in self._pipelines:
             self._pipelines[lang_code] = self._kokoro.KPipeline(
-                lang_code=lang_code, repo_id=self.repo_id, model=self.model, device="cpu"
+                lang_code=lang_code, repo_id=self.repo_id, model=self.model, device=self.device
             )
         return self._pipelines[lang_code]
 

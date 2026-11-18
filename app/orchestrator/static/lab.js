@@ -1,10 +1,11 @@
 // AI Lab: test each model on its own through the orchestrator's existing per-model endpoints.
-//   Whisper  POST /api/whisper/transcribe   (multipart file)
+//   Whisper  POST /api/whisper/transcribe   (multipart file: microphone recording or uploaded file)
 //   Qwen3    POST /api/qwen/generate        (JSON prompt / system_prompt / max_new_tokens, no history)
 //   Kokoro   POST /api/kokoro/synthesize    (JSON text / voice / speed) -> WAV at /api/audio/<name>
 //   MuseTalk POST /api/avatar/generate      (multipart WAV + avatar_id) -> MP4 at /api/avatar/videos/<id>
 // Each run appends its own result card, so several runs (also in different tabs) never overwrite each other.
-// Independent of app.js: shares no state with the conversation.
+// Shares no state with the conversation (app.js); only reuses its recording helpers
+// pickMimeType / extensionFor / micErrorMessage.
 "use strict";
 
 (() => {
@@ -12,6 +13,8 @@
   const VIEWS = ["conversation", "lab"];
   const PANELS = ["whisper", "qwen", "kokoro", "musetalk"];
   const lab = { panel: "whisper", kokoroLatest: null, museAudio: null };
+  const rec = { stream: null, recorder: null, chunks: [], startedAt: 0, timer: null, discard: false };
+  const MAX_LAB_RECORD_SECONDS = 120;
 
   // ---------- navigation (#conversation, #lab, #lab/qwen ...) ----------
 
@@ -25,6 +28,7 @@
       else tab.removeAttribute("aria-current");
     }
     $("status").hidden = name !== "conversation"; // conversation phase pill
+    if (name !== "lab" && rec.recorder) stopLabRecording(true); // leaving the Lab cancels a recording
     if (name === "lab") {
       showPanel(PANELS.includes(panel) ? panel : lab.panel);
       refreshStatus();
@@ -150,20 +154,108 @@
 
   // ---------- Whisper ----------
 
+  /** Send one audio blob (recording or file) to Whisper only and show the result card. */
+  async function transcribe(blob, name, title, extra = {}) {
+    const card = newResult("whisper", title);
+    const form = new FormData();
+    form.append("file", blob, name);
+    const r = await call("/api/whisper/transcribe", { method: "POST", body: form });
+    const t = (r.data && r.data.timings) || {};
+    const metrics = [["Whisper processing", secs(t.transcription_seconds)], ["Server total", secs(t.total_seconds)],
+      ["Round trip", secs(r.ms / 1000)], ...(extra.metrics || []), ["Audio", `${kb(blob.size)} ${blob.type || ""}`.trim()]];
+    if (!r.ok) return card.fail(`Whisper failed (${r.status || "network"}): ${r.error}`, metrics);
+    const nodes = [block("Transcript", r.data.transcript || "(no speech detected)")];
+    if (extra.playback) {
+      const player = el("audio", "lab-audio");
+      player.controls = true;
+      player.src = URL.createObjectURL(blob);
+      nodes.push(player);
+    }
+    card.done(nodes, metrics);
+  }
+
   $("whisper-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const file = event.target.file.files[0];
     if (!file) return;
-    const card = newResult("whisper", file.name);
-    const form = new FormData();
-    form.append("file", file, file.name);
-    const r = await call("/api/whisper/transcribe", { method: "POST", body: form });
-    const t = (r.data && r.data.timings) || {};
-    const metrics = [["Whisper", secs(t.transcription_seconds)], ["Server total", secs(t.total_seconds)],
-      ["Round trip", secs(r.ms / 1000)], ["File", `${kb(file.size)} ${file.type || ""}`.trim()]];
-    if (!r.ok) return card.fail(`Whisper failed (${r.status || "network"}): ${r.error}`, metrics);
-    card.done([block("Transcript", r.data.transcript || "(no speech detected)")], metrics);
+    await transcribe(file, file.name, file.name);
   });
+
+  // Microphone recording for the Whisper test (browser MediaRecorder, same formats as Stella Chat).
+  function recError(text) {
+    $("whisper-rec-error").textContent = text || "";
+    $("whisper-rec-error").hidden = !text;
+  }
+
+  function setRecUi(recording) {
+    $("whisper-rec").textContent = recording ? "■ Stop and transcribe" : "● Start recording";
+    $("whisper-rec").classList.toggle("recording", recording);
+    $("whisper-timer").hidden = !recording;
+  }
+
+  async function startLabRecording() {
+    recError("");
+    if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return recError("The browser blocks the microphone on this address. Open the page via http://localhost:8000 or https:// (see the notice at the top).");
+    }
+    if (typeof window.MediaRecorder === "undefined") return recError("This browser does not support audio recording (MediaRecorder).");
+    try {
+      rec.stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch (error) {
+      return recError(micErrorMessage(error));
+    }
+    const mimeType = pickMimeType();
+    try {
+      rec.recorder = mimeType ? new MediaRecorder(rec.stream, { mimeType }) : new MediaRecorder(rec.stream);
+    } catch (error) {
+      releaseLabMic();
+      return recError(`Recording format not supported by this browser: ${error.message}`);
+    }
+    rec.chunks = [];
+    rec.discard = false;
+    rec.recorder.ondataavailable = (e) => { if (e.data && e.data.size) rec.chunks.push(e.data); };
+    rec.recorder.onstop = onLabRecordingStopped;
+    rec.recorder.start();
+    rec.startedAt = performance.now();
+    setRecUi(true);
+    rec.timer = setInterval(() => {
+      const elapsed = (performance.now() - rec.startedAt) / 1000;
+      $("whisper-timer").textContent = `${elapsed.toFixed(1)} s`;
+      if (elapsed >= MAX_LAB_RECORD_SECONDS) stopLabRecording();
+    }, 100);
+  }
+
+  function releaseLabMic() {
+    if (rec.stream) rec.stream.getTracks().forEach((track) => track.stop());
+    rec.stream = null;
+  }
+
+  function stopLabRecording(discard = false) {
+    if (!rec.recorder) return;
+    rec.discard = discard;
+    rec.stoppedAt = performance.now();
+    clearInterval(rec.timer);
+    if (rec.recorder.state !== "inactive") rec.recorder.stop(); // fires onstop after the final chunk
+    releaseLabMic();
+    setRecUi(false);
+  }
+
+  async function onLabRecordingStopped() {
+    const mime = (rec.recorder && rec.recorder.mimeType) || pickMimeType() || "audio/webm";
+    rec.recorder = null;
+    if (rec.discard) return;
+    const blob = new Blob(rec.chunks, { type: mime });
+    const seconds = (rec.stoppedAt - rec.startedAt) / 1000;
+    if (seconds < 0.5 || blob.size < 1000) return recError("That recording was too short. Record for at least a second while you speak.");
+    const name = `lab-recording.${extensionFor(mime)}`;
+    await transcribe(blob, name, `Microphone · ${seconds.toFixed(1)} s`, {
+      playback: true, metrics: [["Recording", `${seconds.toFixed(1)} s ${mime.split(";")[0].replace("audio/", "")}`]],
+    });
+  }
+
+  $("whisper-rec").addEventListener("click", () => (rec.recorder ? stopLabRecording() : startLabRecording()));
 
   // ---------- Qwen3 ----------
 
@@ -179,10 +271,16 @@
     const r = await call("/api/qwen/generate", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
-    const t = (r.data && r.data.timings) || {};
-    const tokens = r.data && r.data.generated_tokens;
-    const metrics = [["Qwen3 generation", secs(t.generation_seconds)], ["Tokens", tokens],
-      ["Tokens / s", tokens && t.generation_seconds ? (tokens / t.generation_seconds).toFixed(1) : null],
+    const d = r.data || {};
+    const t = d.timings || {};
+    const tokens = d.generated_tokens;
+    const rate = (v) => (typeof v === "number" ? v.toFixed(1) : null);
+    const metrics = [["Qwen3 generation", secs(t.generation_seconds)],
+      ["Time to first token", typeof t.time_to_first_token_seconds === "number" ? secs(t.time_to_first_token_seconds) : (d.backend === "transformers" ? "n/a (CPU backend)" : null)],
+      ["Tokens", tokens],
+      ["Tokens / s (overall)", rate(d.tokens_per_second) || (tokens && t.generation_seconds ? (tokens / t.generation_seconds).toFixed(1) : null)],
+      ["Tokens / s (decode)", rate(d.decode_tokens_per_second)],
+      ["Finish", d.finish_reason], ["Backend", d.backend],
       ["Max new tokens", body.max_new_tokens || "default"], ["Server total", secs(t.total_seconds)],
       ["Round trip", secs(r.ms / 1000)]];
     if (!r.ok) return card.fail(`Qwen3 failed (${r.status || "network"}): ${r.error}`, metrics);
@@ -212,7 +310,9 @@
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
     const t = (r.data && r.data.timings) || {};
-    const metrics = [["Kokoro synthesis", secs(t.synthesis_seconds)], ["Audio length", secs(r.data && r.data.audio_duration_seconds)],
+    const audioSeconds = r.data && r.data.audio_duration_seconds;
+    const metrics = [["Kokoro synthesis", secs(t.synthesis_seconds)], ["Audio length", secs(audioSeconds)],
+      ["Real-time factor", t.synthesis_seconds && audioSeconds ? `${(t.synthesis_seconds / audioSeconds).toFixed(2)}×` : null],
       ["Voice", body.voice], ["Speed", body.speed], ["Server total", secs(t.total_seconds)], ["Round trip", secs(r.ms / 1000)]];
     if (!r.ok) return card.fail(`Kokoro failed (${r.status || "network"}): ${r.error}`, metrics);
 
@@ -314,7 +414,11 @@
   for (const tab of document.querySelectorAll(".subtab")) {
     tab.addEventListener("click", () => { history.replaceState(null, "", `#lab/${tab.dataset.panel}`); showPanel(tab.dataset.panel); });
   }
-  $("lab-refresh").addEventListener("click", () => { refreshStatus(); loadAvatars(); });
+  $("lab-refresh").addEventListener("click", () => {
+    refreshStatus();
+    loadAvatars();
+    if (window.stellaStatus) window.stellaStatus.refresh();
+  });
   // Same voices as the conversation selector.
   $("lab-voice").replaceChildren(...[...$("voice").options].map((o) => new Option(o.textContent, o.value)));
   window.addEventListener("hashchange", route);

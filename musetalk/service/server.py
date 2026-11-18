@@ -107,6 +107,12 @@ def health():
 
         cuda_available = torch.cuda.is_available()
         torch_info = {"torch_version": torch.__version__, "torch_cuda_version": torch.version.cuda}
+        if cuda_available and engine.loaded:
+            # This process's PyTorch GPU memory (orchestrator System status panel).
+            torch_info.update(
+                gpu_memory_reserved_mb=round(torch.cuda.memory_reserved(GPU_ID) / 2**20, 1),
+                gpu_memory_peak_reserved_mb=round(torch.cuda.max_memory_reserved(GPU_ID) / 2**20, 1),
+            )
     except Exception as error:  # noqa: BLE001 - torch itself missing/broken
         cuda_available, torch_info = False, {"torch_error": str(error)}
     body = {

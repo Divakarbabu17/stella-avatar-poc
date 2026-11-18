@@ -36,6 +36,10 @@ services:
       KOKORO_URL: ${KOKORO_URL:-http://kokoro:8003}
       SERVICE_TIMEOUT_SECONDS: ${SERVICE_TIMEOUT_SECONDS:-300}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-25}
+      CONVERSATION_HISTORY_MESSAGES: ${CONVERSATION_HISTORY_MESSAGES:-6}
+      CONVERSATION_MAX_NEW_TOKENS: ${CONVERSATION_MAX_NEW_TOKENS:-96}
+      # Empty = built-in default prompt (app/config.py).
+      QWEN_SYSTEM_PROMPT: ${QWEN_SYSTEM_PROMPT:-}
       # MuseTalk avatar service below (profile "gpu"). false = voice-only; the
       # voice conversation works either way.
       MUSETALK_ENABLED: ${MUSETALK_ENABLED:-false}
@@ -80,6 +84,7 @@ services:
       HF_HOME: /app/models/huggingface
       QWEN_MODEL: ${QWEN_MODEL:-Qwen/Qwen3-0.6B}
       QWEN_MAX_NEW_TOKENS: ${QWEN_MAX_NEW_TOKENS:-256}
+      QWEN_SYSTEM_PROMPT: ${QWEN_SYSTEM_PROMPT:-}
     volumes: *model-cache
     healthcheck:
       <<: *model-healthcheck

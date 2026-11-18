@@ -12,6 +12,7 @@ import re
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -27,12 +28,43 @@ from ..servers.common import saved_upload
 from ..services import InvalidInputError, ServiceUnavailableError
 from ..services.voice import process_voice
 from . import avatar
-from .clients import KokoroClient, QwenClient, WhisperClient
+from .clients import KokoroClient, QwenClient, VllmQwenClient, WhisperClient
 
 AUDIO_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_\-]+\.wav$")
 ERROR_STATUS = {"invalid_input": 422, "unavailable": 503, "failed": 502}
 STATIC_DIR = Path(__file__).parent / "static"
 HISTORY_ADAPTER = TypeAdapter(list[ChatMessage])
+
+
+class PerfLog:
+    """Recent processing times per stage (in memory, last N runs; reset on restart).
+
+    Fed by the AI Lab endpoints and by conversation turns; shown in the System status panel.
+    """
+
+    def __init__(self, size: int = 20):
+        self._size = size
+        self._runs: dict[str, deque] = {}
+        self._lock = threading.Lock()
+
+    def add(self, stage: str, seconds) -> None:
+        if not isinstance(seconds, (int, float)) or seconds < 0:
+            return
+        with self._lock:
+            self._runs.setdefault(stage, deque(maxlen=self._size)).append((time.time(), float(seconds)))
+
+    def summary(self) -> dict:
+        with self._lock:
+            runs = {stage: list(values) for stage, values in self._runs.items()}
+        out = {}
+        for stage, values in runs.items():
+            seconds = [s for _, s in values]
+            out[stage] = {
+                "last_seconds": round(seconds[-1], 3), "avg_seconds": round(sum(seconds) / len(seconds), 3),
+                "min_seconds": round(min(seconds), 3), "max_seconds": round(max(seconds), 3),
+                "count": len(seconds), "last_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(values[-1][0])),
+            }
+        return out
 
 
 @asynccontextmanager
@@ -43,7 +75,14 @@ async def lifespan(app: FastAPI):
     app.state.audio_dir = settings.output_dir / "api"
     app.state.audio_dir.mkdir(parents=True, exist_ok=True)
     app.state.whisper = WhisperClient("whisper", settings.whisper_url, timeout)
-    app.state.qwen = QwenClient("qwen", settings.qwen_url, timeout)
+    if settings.qwen_backend == "vllm":
+        app.state.qwen = VllmQwenClient(
+            "qwen", settings.qwen_url, timeout,
+            model=settings.qwen_model, api_key=settings.qwen_api_key,
+            system_prompt=settings.qwen_system_prompt, max_new_tokens=settings.qwen_max_new_tokens,
+        )
+    else:
+        app.state.qwen = QwenClient("qwen", settings.qwen_url, timeout)
     app.state.kokoro = KokoroClient("kokoro", settings.kokoro_url, timeout)
     # One conversation turn at a time: the CPU models would only queue anyway,
     # and overlapping turns would interleave conversation history.
@@ -51,6 +90,7 @@ async def lifespan(app: FastAPI):
     # MuseTalk avatar (remote GPU service); disabled unless MUSETALK_ENABLED=true.
     app.state.musetalk = avatar.MuseTalkClient(settings)
     app.state.avatar_store = avatar.AvatarStore(settings.output_dir / "avatar_videos", settings.avatar_video_ttl_minutes)
+    app.state.perf = PerfLog()
     yield
     for client in (app.state.whisper, app.state.qwen, app.state.kokoro, app.state.musetalk):
         client.close()
@@ -83,6 +123,15 @@ def _audio_fields(name: str) -> dict:
 
 def _round(timings: dict[str, float]) -> dict[str, float]:
     return {key: round(value, 3) for key, value in timings.items()}
+
+
+def _record_turn(perf: PerfLog, voice_timings: dict, avatar_result: dict | None, total_seconds: float) -> None:
+    perf.add("whisper", voice_timings.get("transcription_seconds"))
+    perf.add("qwen", voice_timings.get("generation_seconds"))
+    perf.add("kokoro", voice_timings.get("synthesis_seconds"))
+    if avatar_result and avatar_result.get("status") == "ready":
+        perf.add("musetalk", (avatar_result.get("timings") or {}).get("musetalk_render_seconds"))
+    perf.add("conversation_turn", total_seconds)
 
 
 def _render_avatar(state, wav: bytes, wanted: bool) -> dict:
@@ -118,6 +167,7 @@ def whisper_transcribe(request: Request, file: UploadFile = File(...)):
     started_at = time.perf_counter()
     with saved_upload(file, request.app.state.settings.max_upload_mb) as audio_path:
         transcript, seconds = _call(request.app.state.whisper.transcribe, audio_path)
+    request.app.state.perf.add("whisper", seconds)
     return {
         "transcript": transcript,
         "timings": _round({"transcription_seconds": seconds, "total_seconds": time.perf_counter() - started_at}),
@@ -126,15 +176,27 @@ def whisper_transcribe(request: Request, file: UploadFile = File(...)):
 
 @app.post("/api/qwen/generate")
 def qwen_generate(request: Request, body: GenerateRequest):
+    """Qwen3 only (AI Lab). With vLLM the reply is streamed internally, which gives
+    time to first token and decode speed; the response is still returned complete."""
     started_at = time.perf_counter()
     history = [message.model_dump() for message in body.history] if body.history else None
-    response, tokens, seconds = _call(
-        request.app.state.qwen.generate, body.prompt, body.system_prompt, body.max_new_tokens, history
+    result = _call(
+        request.app.state.qwen.generate_with_metrics, body.prompt, body.system_prompt, body.max_new_tokens, history
     )
+    perf = request.app.state.perf
+    perf.add("qwen", result["generation_seconds"])
+    perf.add("qwen_ttft", result["time_to_first_token_seconds"])
+    timings = {"generation_seconds": result["generation_seconds"], "total_seconds": time.perf_counter() - started_at}
+    if result["time_to_first_token_seconds"] is not None:
+        timings["time_to_first_token_seconds"] = result["time_to_first_token_seconds"]
     return {
-        "response": response,
-        "generated_tokens": tokens,
-        "timings": _round({"generation_seconds": seconds, "total_seconds": time.perf_counter() - started_at}),
+        "response": result["response"],
+        "generated_tokens": result["generated_tokens"],
+        "backend": result["backend"],
+        "finish_reason": result["finish_reason"],
+        "tokens_per_second": result["tokens_per_second"],
+        "decode_tokens_per_second": result["decode_tokens_per_second"],
+        "timings": _round(timings),
     }
 
 
@@ -142,6 +204,7 @@ def qwen_generate(request: Request, body: GenerateRequest):
 def kokoro_synthesize(request: Request, body: SynthesizeRequest):
     started_at = time.perf_counter()
     wav, duration, seconds = _call(request.app.state.kokoro.synthesize_wav, body.text, body.voice, body.speed)
+    request.app.state.perf.add("kokoro", seconds)
     name = _save_wav(request, "kokoro", wav)
     return {
         **_audio_fields(name),
@@ -242,6 +305,7 @@ def conversation_turn(
 
     body["timings"]["voice_seconds"] = body["timings"].pop("total_seconds")
     body["timings"]["total_seconds"] = round(time.perf_counter() - started_at, 3)
+    _record_turn(state.perf, result.timings, avatar_result, body["timings"]["total_seconds"])
     body.update(
         audio_mime="audio/wav",
         audio_base64=base64.b64encode(result.wav).decode("ascii"),
@@ -249,6 +313,62 @@ def conversation_turn(
         avatar=avatar_result,
     )
     return body
+
+
+def _timed(fn):
+    started_at = time.perf_counter()
+    result = fn()
+    return result, round((time.perf_counter() - started_at) * 1000)
+
+
+def _container_state(health: dict) -> str:
+    """What the orchestrator can tell about a container without Docker access.
+
+    It deliberately has no Docker socket (that would give this unauthenticated page
+    control of the host), so "running" means "answers on the Docker network".
+    """
+    status = health.get("status")
+    if status == "disabled":
+        return "disabled"
+    if status == "unreachable":
+        return "not_reachable"  # stopped, crashed, or still starting (vLLM: still loading)
+    return "running"
+
+
+@app.get("/api/system/status")
+def system_status(request: Request):
+    """Everything the System status panel shows, in one call (checks run in parallel)."""
+    state = request.app.state
+    settings = state.settings
+    clients = {"whisper": state.whisper, "qwen": state.qwen, "kokoro": state.kokoro, "musetalk": state.musetalk}
+    with ThreadPoolExecutor(max_workers=len(clients) + 3) as pool:
+        health_futures = {name: pool.submit(_timed, client.health) for name, client in clients.items()}
+        # Whole-GPU numbers from the first GPU container that can run nvidia-smi.
+        gpu_futures = [pool.submit(client.gpu) for client in (state.whisper, state.kokoro)]
+        engine_future = pool.submit(state.qwen.engine_metrics) if hasattr(state.qwen, "engine_metrics") else None
+        services = {}
+        for name, future in health_futures.items():
+            health, check_ms = future.result()
+            services[name] = {**health, "container": _container_state(health), "health_check_ms": check_ms}
+        snapshots = [future.result() for future in gpu_futures]
+        engine = engine_future.result() if engine_future else None
+
+    gpu = next((snap for snap in snapshots if snap and snap.get("available")), None)
+    if gpu is None:
+        errors = [snap.get("error") for snap in snapshots if snap and snap.get("error")]
+        gpu = {"available": False, "error": errors[0] if errors else "No model service reported GPU metrics."}
+    if engine:
+        services["qwen"]["engine"] = engine
+    if settings.qwen_backend == "vllm" and settings.vllm_gpu_memory_utilization:
+        services["qwen"]["gpu_memory_budget_fraction"] = settings.vllm_gpu_memory_utilization
+    return {
+        "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "qwen_backend": settings.qwen_backend,
+        "musetalk_enabled": settings.musetalk_enabled,
+        "services": services,
+        "gpu": gpu,
+        "performance": state.perf.summary(),
+    }
 
 
 @app.get("/api/avatar/status")
@@ -301,6 +421,8 @@ def avatar_generate(request: Request, file: UploadFile = File(...), avatar_id: s
         raise HTTPException(status_code=422, detail=str(error)) from error
 
     result = avatar.render(state.musetalk, state.avatar_store, settings, wav, avatar_id)
+    if result.get("status") == "ready":
+        state.perf.add("musetalk", (result.get("timings") or {}).get("musetalk_render_seconds"))
     result["audio_duration_seconds"] = round(duration, 3)
     return JSONResponse(result, status_code=AVATAR_HTTP_STATUS.get(result["status"], 502))
 

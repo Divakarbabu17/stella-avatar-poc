@@ -6,6 +6,24 @@ from pathlib import Path
 
 from . import InvalidInputError, require_module
 
+# Sampling settings recommended by Qwen for non-thinking mode. Shared with the
+# orchestrator's vLLM client so both backends answer the same way.
+SAMPLING = {"temperature": 0.7, "top_p": 0.8, "top_k": 20}
+
+
+def build_chat_messages(system_prompt: str, history: list[dict] | None, prompt: str) -> list[dict]:
+    """System prompt, then earlier turns (oldest first), then the new user prompt.
+
+    history: [{"role": "user"|"assistant", "content": str}, ...]; other roles and
+    empty messages are skipped.
+    """
+    messages = [{"role": "system", "content": system_prompt}]
+    for turn in history or []:
+        if turn.get("role") in ("user", "assistant") and str(turn.get("content", "")).strip():
+            messages.append({"role": turn["role"], "content": str(turn["content"]).strip()})
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
 
 class QwenService:
     def __init__(self, model_name: str, cache_dir: Path, system_prompt: str, max_new_tokens: int):
@@ -48,11 +66,7 @@ class QwenService:
         if max_new_tokens < 1:
             raise InvalidInputError("max_new_tokens must be greater than zero.")
 
-        messages = [{"role": "system", "content": system_prompt or self.system_prompt}]
-        for turn in history or []:
-            if turn.get("role") in ("user", "assistant") and str(turn.get("content", "")).strip():
-                messages.append({"role": turn["role"], "content": str(turn["content"]).strip()})
-        messages.append({"role": "user", "content": prompt})
+        messages = build_chat_messages(system_prompt or self.system_prompt, history, prompt)
         # enable_thinking=False makes the Qwen3 chat template skip the <think> phase.
         text = self.tokenizer.apply_chat_template(
             messages,
@@ -64,14 +78,11 @@ class QwenService:
 
         with self._lock, self._torch.inference_mode():
             started_at = time.perf_counter()
-            # Sampling settings recommended by Qwen for non-thinking mode.
             output_ids = self.model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
-                temperature=0.7,
-                top_p=0.8,
-                top_k=20,
+                **SAMPLING,
             )
             seconds = time.perf_counter() - started_at
 

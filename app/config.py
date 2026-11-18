@@ -10,6 +10,16 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+QWEN_BACKENDS = ("transformers", "vllm")
+
+
+def _qwen_backend(value: str) -> str:
+    backend = (value or "transformers").strip().lower()
+    if backend not in QWEN_BACKENDS:
+        raise ValueError(f"QWEN_BACKEND must be one of {', '.join(QWEN_BACKENDS)}, not '{value}'.")
+    return backend
+
+
 @dataclass(frozen=True)
 class Settings:
     model_cache_dir: Path
@@ -22,6 +32,15 @@ class Settings:
     kokoro_voice: str
     kokoro_speed: float
     max_upload_mb: int
+    # Torch device per model service: "cpu" (laptop default) or "cuda"/"cuda:N" (compose.gpu.yaml).
+    whisper_device: str
+    kokoro_device: str
+    # Which Qwen service the orchestrator talks to: "transformers" (app.servers.qwen,
+    # POST /generate) or "vllm" (OpenAI-compatible /v1/chat/completions).
+    qwen_backend: str
+    qwen_api_key: str
+    # vLLM's --gpu-memory-utilization, only for display in the System status panel (None = unknown).
+    vllm_gpu_memory_utilization: float | None
     # Orchestrator -> model service URLs (Docker internal network names).
     whisper_url: str
     qwen_url: str
@@ -53,12 +72,18 @@ class Settings:
             output_dir=Path(env("OUTPUT_DIR", "output")),
             whisper_model=env("WHISPER_MODEL", "base"),
             qwen_model=env("QWEN_MODEL", "Qwen/Qwen3-0.6B"),
-            qwen_system_prompt=env("QWEN_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT),
+            # Compose passes an empty string when the variable is unset; treat that as "use the default".
+            qwen_system_prompt=env("QWEN_SYSTEM_PROMPT", "").strip() or DEFAULT_SYSTEM_PROMPT,
             qwen_max_new_tokens=int(env("QWEN_MAX_NEW_TOKENS", "256")),
             kokoro_repo_id=env("KOKORO_REPO_ID", "hexgrad/Kokoro-82M"),
             kokoro_voice=env("KOKORO_VOICE", "af_heart"),
             kokoro_speed=float(env("KOKORO_SPEED", "1.0")),
             max_upload_mb=int(env("MAX_UPLOAD_MB", "25")),
+            whisper_device=env("WHISPER_DEVICE", "cpu").strip().lower() or "cpu",
+            kokoro_device=env("KOKORO_DEVICE", "cpu").strip().lower() or "cpu",
+            qwen_backend=_qwen_backend(env("QWEN_BACKEND", "transformers")),
+            qwen_api_key=env("QWEN_API_KEY", ""),
+            vllm_gpu_memory_utilization=float(env("VLLM_GPU_MEMORY_UTILIZATION", "").strip() or 0) or None,
             whisper_url=env("WHISPER_URL", "http://whisper:8001").rstrip("/"),
             qwen_url=env("QWEN_URL", "http://qwen:8002").rstrip("/"),
             kokoro_url=env("KOKORO_URL", "http://kokoro:8003").rstrip("/"),

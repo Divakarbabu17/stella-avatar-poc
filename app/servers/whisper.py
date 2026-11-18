@@ -10,7 +10,8 @@ settings = Settings.from_env()
 app, holder = create_service_app(
     "whisper",
     settings.whisper_model,
-    lambda: WhisperService(settings.whisper_model, settings.model_cache_dir),
+    lambda: WhisperService(settings.whisper_model, settings.model_cache_dir, settings.whisper_device),
+    device=settings.whisper_device,
 )
 
 

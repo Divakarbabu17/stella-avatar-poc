@@ -9,6 +9,7 @@ responsive while inference is running.
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -64,7 +65,11 @@ class ModelHolder:
         return self._service
 
 
-def create_service_app(name: str, model_label: str, loader: Callable[[], object]) -> tuple[FastAPI, ModelHolder]:
+def create_service_app(
+    name: str, model_label: str, loader: Callable[[], object], device: str | None = None
+) -> tuple[FastAPI, ModelHolder]:
+    """device (optional): the configured torch device, reported by /health together
+    with GPU name and memory once a CUDA model is loaded."""
     holder = ModelHolder(name, model_label, loader)
     started_at = time.time()
 
@@ -88,11 +93,100 @@ def create_service_app(name: str, model_label: str, loader: Callable[[], object]
             "uptime_seconds": round(time.time() - started_at, 1),
             "memory_rss_mb": rss_mb(),
         }
+        if device:
+            body["device"] = device
+            if holder.status == "ready":
+                body.update(cuda_status(device))
         if holder.error:
             body["error"] = holder.error
         return JSONResponse(body, status_code=200 if holder.status == "ready" else 503)
 
+    @app.get("/gpu")
+    def gpu():
+        """Whole-GPU utilization and memory as nvidia-smi reports them (all processes).
+
+        Used by the orchestrator's System status panel. {"available": false} in CPU containers.
+        """
+        return nvidia_smi_snapshot()
+
     return app, holder
+
+
+# nvidia-smi is injected by the NVIDIA Container Toolkit ("utility" capability);
+# under WSL2 it lives in /usr/lib/wsl/lib.
+NVIDIA_SMI_CANDIDATES = ("nvidia-smi", "/usr/lib/wsl/lib/nvidia-smi", "/usr/bin/nvidia-smi")
+GPU_QUERY = (
+    ("index", int), ("name", str), ("utilization.gpu", float), ("memory.used", float),
+    ("memory.total", float), ("temperature.gpu", float), ("power.draw", float), ("driver_version", str),
+)
+GPU_KEYS = {
+    "utilization.gpu": "utilization_percent", "memory.used": "memory_used_mb", "memory.total": "memory_total_mb",
+    "temperature.gpu": "temperature_c", "power.draw": "power_w",
+}
+
+
+def _nvidia_smi_path() -> str | None:
+    for candidate in NVIDIA_SMI_CANDIDATES:
+        found = shutil.which(candidate) or (candidate if os.path.isfile(candidate) else None)
+        if found:
+            return found
+    return None
+
+
+def nvidia_smi_snapshot() -> dict:
+    executable = _nvidia_smi_path()
+    if executable is None:
+        return {"available": False, "error": "nvidia-smi not found in this container (CPU mode or no GPU utility access)."}
+    fields = ",".join(name for name, _ in GPU_QUERY)
+    try:
+        result = subprocess.run(
+            [executable, f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"available": False, "error": f"nvidia-smi failed: {error}"}
+    if result.returncode != 0:
+        return {"available": False, "error": f"nvidia-smi failed: {(result.stderr or result.stdout).strip()[-300:]}"}
+    gpus = []
+    for line in result.stdout.strip().splitlines():
+        values = [value.strip() for value in line.split(",")]
+        if len(values) != len(GPU_QUERY):
+            continue
+        gpu = {}
+        for (name, kind), raw in zip(GPU_QUERY, values):
+            key = GPU_KEYS.get(name, name)
+            try:
+                gpu[key] = kind(raw) if raw and not raw.startswith("[") else None  # "[N/A]" -> None
+            except ValueError:
+                gpu[key] = None
+        gpus.append(gpu)
+    if not gpus:
+        return {"available": False, "error": "nvidia-smi returned no GPUs."}
+    return {"available": True, "source": "nvidia-smi", "gpus": gpus}
+
+
+def cuda_status(device: str) -> dict:
+    """GPU name and this process's PyTorch GPU memory (empty for CPU devices).
+
+    reserved = what PyTorch's caching allocator holds (what nvidia-smi attributes
+    to the process, minus the CUDA context of roughly 0.3-0.5 GB).
+    """
+    if not device.startswith("cuda"):
+        return {}
+    try:
+        import torch
+
+        index = int(device.split(":")[1]) if ":" in device else 0
+        return {
+            "gpu": torch.cuda.get_device_name(index),
+            "torch_version": torch.__version__,
+            "torch_cuda_version": torch.version.cuda,
+            "gpu_memory_allocated_mb": round(torch.cuda.memory_allocated(index) / 2**20, 1),
+            "gpu_memory_reserved_mb": round(torch.cuda.memory_reserved(index) / 2**20, 1),
+            "gpu_memory_peak_reserved_mb": round(torch.cuda.max_memory_reserved(index) / 2**20, 1),
+        }
+    except Exception as error:  # noqa: BLE001 - diagnostic only
+        return {"gpu_error": str(error)}
 
 
 def rss_mb() -> float | None:

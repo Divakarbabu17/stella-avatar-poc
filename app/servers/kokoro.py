@@ -14,7 +14,10 @@ settings = Settings.from_env()
 app, holder = create_service_app(
     "kokoro",
     f"{settings.kokoro_repo_id} (default voice {settings.kokoro_voice})",
-    lambda: KokoroService(settings.kokoro_repo_id, settings.hf_cache_dir, settings.kokoro_voice, settings.kokoro_speed),
+    lambda: KokoroService(
+        settings.kokoro_repo_id, settings.hf_cache_dir, settings.kokoro_voice, settings.kokoro_speed, settings.kokoro_device
+    ),
+    device=settings.kokoro_device,
 )
 
 

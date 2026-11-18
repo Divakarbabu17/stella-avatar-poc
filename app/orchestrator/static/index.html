@@ -17,9 +17,28 @@
     </header>
 
     <nav class="tabs" aria-label="Sections">
-      <a href="#conversation" class="tab" data-view="conversation" aria-current="page">Conversation</a>
+      <a href="#conversation" class="tab" data-view="conversation" aria-current="page">Stella Chat</a>
       <a href="#lab" class="tab" data-view="lab">AI Lab</a>
     </nav>
+
+    <p id="secure-warning" class="message" hidden></p>
+
+    <!-- System status (status.js): containers, model readiness, GPU, recent timings. Shown on both views. -->
+    <details id="system" class="system" open>
+      <summary><span class="system-title">System status</span> <span id="sys-summary" class="sys-summary">checking…</span></summary>
+      <div class="system-body">
+        <div class="sys-bar">
+          <span id="sys-updated" class="hint"></span>
+          <label class="toggle"><input id="sys-auto" type="checkbox" checked> Auto-refresh (10 s)</label>
+          <button id="sys-refresh" type="button">Refresh</button>
+        </div>
+        <div id="sys-services" class="sys-grid"></div>
+        <div class="sys-grid two">
+          <article id="sys-gpu" class="svc"><header><strong>GPU</strong></header><p class="hint">checking…</p></article>
+          <article id="sys-perf" class="svc"><header><strong>Recent processing times</strong></header><p class="hint">No runs yet.</p></article>
+        </div>
+      </div>
+    </details>
 
     <div id="view-conversation" class="view">
     <div class="layout">
@@ -98,15 +117,21 @@
         </div>
         <button id="lab-refresh" type="button">Refresh status</button>
       </div>
-      <p class="lab-note">Each test calls only the selected model. The conversation and its history are not used or changed.</p>
+      <p class="lab-note">Each test calls only the selected model's container (through the orchestrator). The other models are not involved, and Stella Chat and its history are not used or changed.</p>
 
       <section class="panel" data-panel="whisper" role="tabpanel" aria-label="Whisper">
         <div class="panel-head">
           <h2>Whisper · speech to text</h2>
           <span class="badge" data-svc="whisper" data-state="checking">checking…</span>
         </div>
+        <div class="recorder">
+          <button id="whisper-rec" type="button" class="run">● Start recording</button>
+          <span id="whisper-timer" class="timer" hidden>0.0 s</span>
+          <span class="hint">Speak, then press Stop. The recording goes to Whisper only.</span>
+        </div>
+        <p id="whisper-rec-error" class="message" hidden></p>
         <form id="whisper-form" class="lab-form">
-          <label>Audio file <small>(wav, mp3, m4a, ogg, webm, flac…)</small>
+          <label>…or upload an audio file <small>(wav, mp3, m4a, ogg, webm, flac…)</small>
             <input name="file" type="file" accept="audio/*,.wav,.mp3,.m4a,.ogg,.webm,.flac,.opus" required>
           </label>
           <div class="form-actions"><button type="submit" class="run">Transcribe</button></div>
@@ -179,5 +204,6 @@
   </main>
   <script src="/static/app.js"></script>
   <script src="/static/lab.js"></script>
+  <script src="/static/status.js"></script>
 </body>
 </html>

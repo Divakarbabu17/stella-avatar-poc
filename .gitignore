@@ -15,6 +15,9 @@ musetalk/.env
 musetalk/models/
 musetalk/outputs/
 
+# Optional orchestrator TLS certificate and private key (compose.gpu.yaml)
+certs/
+
 # Avatar media (personal likeness): keep only the instructions in git
 avatars/*/*
 !avatars/*/README.md

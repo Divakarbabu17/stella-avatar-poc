@@ -9,6 +9,10 @@
 #
 # Package layers come before `COPY app`, so code edits rebuild in seconds.
 # The pip cache mount keeps downloaded wheels between builds.
+#
+# GPU builds (compose.gpu.yaml, AI1) use the same targets with two build args:
+#   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126  TORCH_SPEC=torch==2.6.0
+# The defaults below build the CPU images exactly as before.
 
 # ---------- orchestrator ----------
 FROM python:3.11-slim AS orchestrator
@@ -26,7 +30,7 @@ COPY app ./app
 EXPOSE 8000
 CMD ["uvicorn", "app.orchestrator.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
-# ---------- shared ML base: FFmpeg + CPU-only PyTorch ----------
+# ---------- shared ML base: FFmpeg + PyTorch (CPU by default, CUDA via build args) ----------
 FROM python:3.11-slim AS torch-base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -38,10 +42,17 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# CPU wheel index: no CUDA libraries. Installed first so no later
-# requirement can pull a CUDA build of torch.
-RUN python -m pip install --no-cache-dir torch \
-    --index-url https://download.pytorch.org/whl/cpu
+# Default: CPU wheel index, no CUDA libraries (laptop). GPU: a CUDA wheel index;
+# those wheels bundle the CUDA runtime, so only the host NVIDIA driver is needed.
+# torch is installed first and then pinned through PIP_CONSTRAINT, so no later
+# requirement can replace it with a different (CPU or CUDA) build.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+ARG TORCH_SPEC=torch
+RUN python -m pip install --no-cache-dir "${TORCH_SPEC}" \
+        --index-url "${TORCH_INDEX_URL}" \
+    && python -m pip freeze | grep -E '^torch==' > /etc/pip-torch-constraint.txt \
+    && cat /etc/pip-torch-constraint.txt
+ENV PIP_CONSTRAINT=/etc/pip-torch-constraint.txt
 
 COPY requirements/api.txt requirements/
 RUN --mount=type=cache,target=/root/.cache/pip \
