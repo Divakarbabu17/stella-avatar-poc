@@ -163,6 +163,9 @@ services:
       MUSETALK_OUTPUT_TTL_MINUTES: ${MUSETALK_OUTPUT_TTL_MINUTES:-30}
       MUSETALK_PREPARE_ON_START: ${MUSETALK_PREPARE_ON_START:-true}
       HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+      # MuseTalk's S3FD face detector is fetched with torch.hub (load_url) when the service
+      # starts; keep that cache in the persistent models folder, not inside the container.
+      TORCH_HOME: /opt/MuseTalk/models/torch
     volumes:
       - ${MUSETALK_MODELS_DIR:-./musetalk/models}:/opt/MuseTalk/models   # weights (download_weights.sh)
       - ./avatars:/data/avatars:ro                                        # avatars/<id>/reference.mp4

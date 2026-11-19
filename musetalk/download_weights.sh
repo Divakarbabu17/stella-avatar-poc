@@ -45,11 +45,21 @@ huggingface-cli download ByteDance/LatentSync --local-dir $CheckpointsDir/syncne
 
 # Face parsing (BiSeNet) weights from Google Drive, plus the ResNet18 backbone
 if [ ! -s $CheckpointsDir/face-parse-bisent/79999_iter.pth ]; then
-  gdown --id 154JgKpzCPW82qINcVieuPH3fZ2e0P812 -O $CheckpointsDir/face-parse-bisent/79999_iter.pth
+  # URL form: works with old and new gdown (gdown 5+ removed the --id option).
+  gdown "https://drive.google.com/uc?id=154JgKpzCPW82qINcVieuPH3fZ2e0P812" -O $CheckpointsDir/face-parse-bisent/79999_iter.pth
 fi
 if [ ! -s $CheckpointsDir/face-parse-bisent/resnet18-5c106cde.pth ]; then
   curl -fL https://download.pytorch.org/models/resnet18-5c106cde.pth \
     -o $CheckpointsDir/face-parse-bisent/resnet18-5c106cde.pth
+fi
+
+# S3FD face detector. MuseTalk downloads it itself via torch.hub when the service starts
+# (musetalk/utils/face_detection/detection/sfd/sfd_detector.py). Pre-fetching it into
+# models/torch (TORCH_HOME in compose.gpu.yaml) keeps it persistent and offline-safe.
+mkdir -p $CheckpointsDir/torch/hub/checkpoints
+if [ ! -s $CheckpointsDir/torch/hub/checkpoints/s3fd-619a316812.pth ]; then
+  curl -fL https://www.adrianbulat.com/downloads/python-fan/s3fd-619a316812.pth \
+    -o $CheckpointsDir/torch/hub/checkpoints/s3fd-619a316812.pth
 fi
 
 echo "All MuseTalk weights are in $(pwd)/$CheckpointsDir"

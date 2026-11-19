@@ -71,6 +71,7 @@ Weights are **never** downloaded during `docker build`. They live in host folder
 | Whisper `large-v3-turbo` | ~1.6 GB | `models/large-v3-turbo.pt` | step 4b (or on first start) |
 | Kokoro-82M + voice `af_heart` | ~0.35 GB | `models/huggingface/models--hexgrad--Kokoro-82M/` | step 4b (or on first start) |
 | MuseTalk 1.5 set (UNet, SD-VAE, whisper-tiny, DWPose, face-parsing, SyncNet, v1.0 UNet) | ~9–10 GB | `musetalk/models/` | step 4b, `download_weights.sh` (required) |
+| MuseTalk face detector S3FD (`s3fd-619a316812.pth`) | ~86 MB | `musetalk/models/torch/hub/checkpoints/` | step 4b, `download_weights.sh` (otherwise fetched at every container start) |
 | vLLM compile cache | < 1 GB | Docker volume `stella-gpu_vllm-cache` | automatic |
 | Prepared avatar (crops, latents, masks) | < 1 GB | Docker volume `stella-gpu_musetalk-results` | automatic, on first start |
 | Generated avatar MP4s | small, TTL 60 min | `output/avatar_videos/` | runtime |
